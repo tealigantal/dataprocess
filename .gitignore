@@ -1,0 +1,5 @@
+# Ignore Python cache
+__pycache__/
+# ielts data pipeline outputs
+ielts-data-pipeline/.env
+ielts-data-pipeline/augmented.jsonl
