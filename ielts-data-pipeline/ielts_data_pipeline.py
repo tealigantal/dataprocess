@@ -1,190 +1,187 @@
-"""
-IELTS Part-2 数据生成 & 复制脚本
---------------------------------
-依赖:  pip install openai python-dotenv
-环境:  .env 里写 DEEPSEEK_API_KEY=sk-xxxx
-"""
-
-import json
-import os
-import random
+import json, random, re, time, os, textwrap
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
-
-# ─── OpenAI ≥1.x 客户端 (DeepSeek 兼容) ─────────────────────────
+from typing import List, Dict, Any
 from openai import OpenAI
 
-_client: OpenAI | None = None
+"""IELTS Part‑2 Synthetic Data Generator (DeepSeek)
+--------------------------------------------------
+• 运行脚本直接进入审核循环。
+  - Enter/空行   : 生成 1 条候选 → Y 保存 / n 丢弃
+  - x            : 批量模式 (输入数量后自动保存)
+  - q            : 退出
+• Debug：格式不符的原始返回写入 `bad_raw.log`。
+  (修正 2025‑06‑23：不再使用 Path.write_text(append=True)，改为标准文件追加)
+"""
 
+# ------------------ 0. DeepSeek 客户端 ------------------ #
+API_KEY = os.getenv("DEEPSEEK_API_KEY")
+if not API_KEY:
+    raise RuntimeError("缺少环境变量 DEEPSEEK_API_KEY")
+client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
 
-def get_client() -> OpenAI:
-    """单例获取 OpenAI 客户端，指向 DeepSeek API"""
-    global _client
-    if _client is None:
-        api_key = os.getenv("DEEPSEEK_API_KEY")
-        if not api_key:
-            raise RuntimeError("环境变量 DEEPSEEK_API_KEY 未设置")
-        _client = OpenAI(
-            api_key=api_key,
-            base_url=os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com"),
-        )
-    return _client
+RAW_LOG = Path("bad_raw.log")
+TRAIN_FILE = Path("train.jsonl")
 
+# ------------------ 1. Few‑shot 样本 ------------------ #
 
-# ─── 工具函数 ─────────────────────────────────────────────────
-def load_env() -> None:
-    """读取本目录 .env 到环境变量"""
-    env_file = Path(__file__).with_name(".env")
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.strip() and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+def load_examples(k: int = 3) -> List[Dict[str, Any]]:
+    p = Path(__file__).with_name("lora_qwen_finetuning.json")
+    data = list(json.loads(p.read_text(encoding="utf-8")).values())
+    random.shuffle(data)
+    return [
+        {
+            "plain": d["input"]["plain"],
+            "pause_count": d["input"]["pause_count"],
+            "pause_total": d["input"]["pause_total"],
+            "errors": d["input"].get("errors", []),
+            "score": d["output"]["score"],
+            "explanation": d["output"]["explanation"],
+        }
+        for d in data[:k]
+    ]
 
-
-def load_sample() -> Dict[str, Any]:
-    """取示范 JSON 第一条，保留所需字段"""
-    path = Path(__file__).with_name("lora_qwen_finetuning.json")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    sample = data[next(iter(data))]
-    return {
-        "plain": sample.get("plain", ""),
-        "errors": sample.get("errors", []),
-        "output": sample.get("output", {}),
-        "output_expanded": sample.get("output_expanded", {}),
-    }
-
+# ------------------ 2. Topic 列表 ------------------ #
 
 def load_topics() -> List[str]:
-    path = Path(__file__).with_name("topics.txt")
-    return [t.strip() for t in path.read_text(encoding="utf-8").splitlines() if t.strip()]
-
-
-def build_messages(topic: str, example: Dict[str, Any]) -> List[Dict[str, str]]:
-    sys_prompt = (
-        "你是雅思口语数据生成助手。请输出与示例结构完全一致的 JSON，仅含 "
-        "plain, errors, output, output_expanded 字段，不要 tokens。"
-    )
-    user_prompt = (
-        "示例:\n" + json.dumps(example, ensure_ascii=False, indent=2) +
-        f"\n\n话题: {topic}\n请生成新样本。"
-    )
     return [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_prompt},
+        t.strip()
+        for t in Path(__file__).with_name("topics.txt").read_text(encoding="utf-8").splitlines()
+        if t.strip()
+    ]
+
+# ------------------ 3. Prompt ------------------ #
+SCHEMA = (
+    "{"  # 紧凑写法
+    '"input":{"plain":str,"pause_count":int,"pause_total":float,"errors":list[str]},'
+    '"output":{"score":str,"explanation":str}'
+    "}"
+)
+
+BASE_SYS = (
+    "你是 IELTS Part‑2 样本生成助手。只返回一行 JSON (不加 markdown)。\n"
+    f"结构必须为: {SCHEMA}\n"
+    "文本 190‑230 词, ≥2 C1 形容词, ≥3 连接词, ≥3 复杂句, 停顿统计匹配长度。"
+)
+
+# ------------------ 4. 验证 & 清理 ------------------ #
+
+def _rand_pause(words: int) -> tuple[int, float]:
+    pc = max(1, int(words * random.uniform(0.03, 0.07)))
+    return pc, round(pc * random.uniform(0.6, 1.2), 2)
+
+
+def _clean_raw(raw: str) -> str:
+    """去掉 ```json ...``` 或反引号围栏"""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`").lstrip("json").strip()
+    return raw
+
+
+def validate(raw: str) -> Dict[str, Any] | None:
+    raw = _clean_raw(raw)
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    need_in = {"plain", "pause_count", "pause_total", "errors"}
+    need_out = {"score", "explanation"}
+    if (
+        isinstance(d, dict)
+        and "input" in d
+        and "output" in d
+        and set(d["input"]) >= need_in
+        and set(d["output"]) >= need_out
+    ):
+        return d
+    return None
+
+# ------------------ 5. 生成 ------------------ #
+
+def build_messages(topic: str, exs: List[Dict[str, Any]]):
+    band = random.choice(["5.0-5.5", "6.0-6.5", "7.0-7.5"])
+    few = "\n\n".join(
+        [f"示例{i+1}:\n{json.dumps(e,ensure_ascii=False,indent=2)}" for i, e in enumerate(exs)]
+    )
+    user = f"{few}\n\n话题: {topic}\n目标总分: {band}\n生成全新样本。"
+    return [
+        {"role": "system", "content": BASE_SYS},
+        {"role": "user", "content": user},
     ]
 
 
-def strip_code_fence(text: str) -> str:
-    """去掉 ```json ... ``` 或 ``` ... ``` 包裹"""
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        # 删首行 ``` 或 ```json
-        lines = lines[1:]
-        # 删末行 ```
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return text
-
-
-# ─── DeepSeek 调用 ─────────────────────────────────────────────
-def call_deepseek(messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
-    resp = get_client().chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        temperature=temperature,
-    )
-    return resp.choices[0].message.content
-
-
-# ─── 生成 & 校验 ───────────────────────────────────────────────
-def generate_one(topic: str, example: Dict[str, Any]) -> Dict[str, Any]:
-    content = strip_code_fence(call_deepseek(build_messages(topic, example)))
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"JSON 解析失败: {e}\n返回内容:\n{content}")
-
-
-def basic_checks(d: Dict[str, Any]) -> Tuple[bool, str]:
-    if not isinstance(d, dict):
-        return False, "结果不是 dict"
-    if "plain" not in d or "output" not in d:
-        return False, "缺少 plain 或 output"
-    for i, err in enumerate(d.get("errors", [])):
-        word = err.get("word") if isinstance(err, dict) else None
-        if word and word not in d["plain"]:
-            return False, f"errors[{i}].word 未出现在 plain"
-    return True, ""
-
-
-def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False)
-        f.write("\n")
-
-
-# ─── 批量逻辑 ────────────────────────────────────────────────
-def bulk_generate(n: int, example: Dict[str, Any], topics: List[str], out: Path) -> None:
-    ok_cnt = 0
-    for idx in range(1, n + 1):
-        for attempt in range(3):
-            try:
-                data = generate_one(random.choice(topics), example)
-                valid, msg = basic_checks(data)
-                if valid:
-                    append_jsonl(out, data)
-                    ok_cnt += 1
-                    print(f"[{idx}/{n}] ✓")
-                    break
-                print(f"[{idx}/{n}] 校验失败: {msg}")
-            except Exception as e:
-                print(f"[{idx}/{n}] 生成异常: {e}")
-        else:
-            print(f"[{idx}/{n}] ⚠ 放弃")
-    print(f"批量结束: 成功 {ok_cnt}/{n} 条")
-
-
-# ─── 交互式入口 ───────────────────────────────────────────────
-def interactive_loop() -> None:
-    load_env()
-    example = load_sample()
-    topics = load_topics()
-    out_path = Path(__file__).with_name("augmented.jsonl")
-
-    while True:
+def generate_one(topic: str, exs: List[Dict[str, Any]]):
+    msgs = build_messages(topic, exs)
+    for attempt in range(3):
         try:
-            data = generate_one(random.choice(topics), example)
-        except Exception as e:
-            print(f"[error] {e}\n")
-            continue
+            rsp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=msgs,
+                temperature=0.9,
+                top_p=0.9,
+            ).choices[0].message.content
+        except Exception as api_err:
+            raise RuntimeError(f"API 调用失败: {api_err}")
+        data = validate(rsp)
+        if data:
+            if not data["input"]["pause_count"] or not data["input"]["pause_total"]:
+                w = len(re.findall(r"\\b\\w+\\b", data["input"]["plain"]))
+                data["input"]["pause_count"], data["input"]["pause_total"] = _rand_pause(w)
+            return data
+        # 写入日志（追加）
+        with RAW_LOG.open("a", encoding="utf-8") as log:
+            log.write(
+                textwrap.dedent(
+                    f"\n===== Attempt {attempt+1} =====\n{rsp[:1000]}\n"
+                )
+            )
+        print("⚠️ 模型返回格式不符，已写入 bad_raw.log (首 200 字):", rsp[:200])
+        time.sleep(1)
+    raise RuntimeError("多次生成均失败，检查提示词/网络")
 
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-        cmd = input("y=保存, n=丢弃, 输入“进行数据复制”开始批量: ").strip()
+# ------------------ 6. 保存 ------------------ #
 
-        if cmd == "y":
-            ok, msg = basic_checks(data)
-            if ok:
-                append_jsonl(out_path, data)
-                print("✓ 已保存\n")
-            else:
-                print(f"✗ 校验失败: {msg}\n")
+def save(obj: Dict[str, Any]):
+    with TRAIN_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-        elif cmd == "进行数据复制":
+# ------------------ 7. 主循环 ------------------ #
+
+def main():
+    topics = load_topics()
+    examples = load_examples(k=5)
+    saved = 0
+    print("进入审核模式: Y 保存 / n 丢弃 / x 批量复制 / q 退出\n")
+    while True:
+        cmd = input("指令(Enter=生成): ").strip().lower()
+        if cmd in {"q", "quit"}:
+            print(f"退出。共保存 {saved} 条。"); break
+        if cmd == "x":
             try:
-                n = int(input("生成数量 N: ").strip())
-                bulk_generate(n, example, topics, out_path)
+                n = int(input("批量数量 > "))
             except ValueError:
-                print("N 需为整数\n")
-
-        elif cmd == "n":
-            print("已丢弃\n")
+                print("数量无效\n"); continue
+            for i in range(n):
+                topic = random.choice(topics)
+                try:
+                    samp = generate_one(topic, examples)
+                    save(samp); saved += 1
+                    print(f"✔ 批量 {i+1}/{n}")
+                except Exception as e:
+                    print("✖ 失败:", e)
+            continue
+        # 单条模式
+        topic = random.choice(topics)
+        try:
+            samp = generate_one(topic, examples)
+        except Exception as e:
+            print("生成失败:", e); continue
+        print("\n===== 候选样本 =====")
+        print(json.dumps(samp, ensure_ascii=False, indent=2))
+        if input("保存? (Y/n) > ").strip().lower() in {"", "y", "yes"}:
+            save(samp); saved += 1; print(f"✔ 保存，总计 {saved}\n")
         else:
-            print("指令未识别\n")
+            print("△ 丢弃\n")
 
-
-# ─── 主执行 ───────────────────────────────────────────────────
 if __name__ == "__main__":
-    interactive_loop()
+    main()
