@@ -22,6 +22,24 @@ client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
 RAW_LOG = Path("bad_raw.log")
 TRAIN_FILE = Path("train.jsonl")
 
+# ------------------ 0.b 服务器可用性检查 ------------------ #
+
+def check_deepseek(timeout: int = 10) -> bool:
+    """简易连通性测试：发送最小请求并捕获异常。"""
+    try:
+        _ = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            temperature=0,
+            top_p=0.1,
+            timeout=timeout,
+        )
+        return True
+    except Exception as err:  # 广泛捕获，避免依赖 openai 内部异常类型
+        print(f"❌ DeepSeek API 不可用: {err}")
+        return False
+
 # ------------------ 1. Few‑shot 样本 ------------------ #
 
 def load_examples(k: int = 3) -> List[Dict[str, Any]]:
@@ -61,6 +79,7 @@ BASE_SYS = (
     "你是 IELTS Part‑2 样本生成助手。只返回一行 JSON (不加 markdown)。\n"
     f"结构必须为: {SCHEMA}\n"
     "文本 190‑230 词, ≥2 C1 形容词, ≥3 连接词, ≥3 复杂句, 停顿统计匹配长度。"
+    "判断 errors 字段时，需忽略大小写、连字符与标点等形式差异，仅记录真正影响含义的拼写/语法错误。"
 )
 
 # ------------------ 4. 验证 & 清理 ------------------ #
@@ -117,7 +136,7 @@ def generate_one(topic: str, exs: List[Dict[str, Any]]):
             rsp = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=msgs,
-                temperature=0.9,
+                temperature=1.0,
                 top_p=0.9,
             ).choices[0].message.content
         except Exception as api_err:
@@ -148,6 +167,10 @@ def save(obj: Dict[str, Any]):
 # ------------------ 7. 主循环 ------------------ #
 
 def main():
+     # 启动前检查 DeepSeek 服务器状态
+    if not check_deepseek():
+        print("请检查网络或 API Key 后重试。程序已退出。")
+        return
     topics = load_topics()
     examples = load_examples(k=5)
     saved = 0
